@@ -46,6 +46,13 @@ def _pick(item: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
+def _normalize_stock_code(code: str) -> str:
+    normalized = code.strip().upper()
+    if len(normalized) == 7 and normalized.startswith("A") and normalized[1:].isdigit():
+        return normalized[1:]
+    return normalized
+
+
 def _extract_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     response = payload.get("response")
     if isinstance(response, dict):
@@ -77,6 +84,7 @@ def _to_record(item: dict[str, Any]) -> StockMasterRecord | None:
     if not code or not name_kr or not market:
         return None
 
+    code = _normalize_stock_code(code)
     is_common_stock, is_preferred, is_etf, is_etn, is_spac, security_type = _normalize_bool_flags(name_kr)
     return StockMasterRecord(
         code=code,

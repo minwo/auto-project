@@ -44,6 +44,21 @@ CREATE TABLE IF NOT EXISTS daily_disclosures (
     PRIMARY KEY (trade_date, code, receipt_no)
 );
 
+CREATE TABLE IF NOT EXISTS daily_news (
+    trade_date DATE NOT NULL,
+    code VARCHAR(12) NOT NULL REFERENCES stock_master(code),
+    news_id VARCHAR(64) NOT NULL,
+    title VARCHAR(500) NOT NULL,
+    url TEXT NOT NULL,
+    source VARCHAR(64) NOT NULL,
+    published_at TIMESTAMPTZ,
+    summary TEXT,
+    news_type VARCHAR(64),
+    trust_score NUMERIC(4, 2) NOT NULL DEFAULT 0.50,
+    ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (trade_date, code, news_id)
+);
+
 CREATE TABLE IF NOT EXISTS daily_market_warnings (
     trade_date DATE NOT NULL,
     code VARCHAR(12) NOT NULL REFERENCES stock_master(code),
@@ -93,6 +108,19 @@ CREATE TABLE IF NOT EXISTS backtest_summaries (
     PRIMARY KEY (start_date, end_date)
 );
 
+CREATE TABLE IF NOT EXISTS daily_top_score_picks (
+    pick_date DATE PRIMARY KEY,
+    code VARCHAR(12) NOT NULL REFERENCES stock_master(code),
+    name VARCHAR(120) NOT NULL,
+    sector VARCHAR(120) NOT NULL,
+    total_score NUMERIC(5, 2) NOT NULL,
+    base_close NUMERIC(18, 4) NOT NULL,
+    reasons_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    risk_flags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_daily_candidate_scores_score_date
     ON daily_candidate_scores (score_date, total_score DESC);
 
@@ -101,3 +129,9 @@ CREATE INDEX IF NOT EXISTS idx_daily_candidate_scores_search_name
 
 CREATE INDEX IF NOT EXISTS idx_daily_prices_code_date
     ON daily_prices (code, trade_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_daily_news_code_date
+    ON daily_news (code, trade_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_daily_top_score_picks_pick_date
+    ON daily_top_score_picks (pick_date DESC);

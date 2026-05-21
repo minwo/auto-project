@@ -4,13 +4,14 @@ from datetime import date
 
 from fastapi.testclient import TestClient
 
-import app.main as app_main
-from app.main import build_repository, create_app
+import app.api.dependencies as app_deps
+from app.api.dependencies import build_repository
+from app.main import create_app
 from app.repository import CandidateRepository, UnavailableRepository
 
-
 def test_build_repository_returns_empty_repository_when_database_is_not_configured(monkeypatch) -> None:
-    monkeypatch.delenv("DATABASE_URL", raising=False)
+    from app.settings import Settings
+    monkeypatch.setattr("app.api.dependencies.load_settings", lambda: Settings(use_database=False))
 
     repo = build_repository()
 
@@ -35,10 +36,11 @@ def test_build_repository_returns_unavailable_repository_when_database_connectio
     def _raise(_url: str):
         raise RuntimeError("database connection failed")
 
-    monkeypatch.setattr(app_main, "create_postgres_repository", _raise)
+    monkeypatch.setattr(app_deps, "create_postgres_repository", _raise)
 
     repo = build_repository()
 
     assert isinstance(repo, UnavailableRepository)
     assert repo.database_configured is True
     assert "database connection failed" in repo.error_message
+

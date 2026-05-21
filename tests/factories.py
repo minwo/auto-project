@@ -26,6 +26,7 @@ def make_snapshot(
         close=11_220.0,
         high=11_400.0,
         low=10_100.0,
+        open_price=10_200.0,
         prev_close=10_000.0,
         volume=440_000.0,
         turnover=6_000_000_000.0,

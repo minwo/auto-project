@@ -21,8 +21,10 @@ def make_snapshot(
     high: float = 11_400.0,
     low: float = 10_100.0,
     close: float = 11_220.0,
+    open_price: float = 10_200.0,
     listed_days: int = 180,
     avg_turnover_20d: float = 2_000_000_000,
+    market_regime: str = "neutral",
 ) -> StockSnapshot:
     return StockSnapshot(
         date=date(2026, 4, 22),
@@ -37,6 +39,7 @@ def make_snapshot(
         close=close,
         high=high,
         low=low,
+        open_price=open_price,
         prev_close=10_000.0,
         volume=200_000 * volume_ratio_20d,
         turnover=2_000_000_000 * turnover_ratio_20d,
@@ -46,6 +49,9 @@ def make_snapshot(
         sector_rising_peers=sector_rising_peers,
         sector_turnover_ratio=sector_turnover_ratio,
         has_leading_move=True,
+        market_regime=market_regime,
+        market_breadth_pct=25.0 if market_regime == "bear" else 55.0,
+        market_avg_return_pct=-1.4 if market_regime == "bear" else 0.1,
         warning_level=warning_level,
         speculative_theme=speculative_theme,
         rumor_news=rumor_news,
@@ -61,6 +67,37 @@ def test_positive_catalyst_and_liquidity_raise_score() -> None:
     assert evaluation.breakdown.liquidity_score >= 20.0
     assert evaluation.breakdown.catalyst_score >= 8.0
     assert evaluation.score >= 60.0
+    target_price = evaluation.target_price_payload()
+    assert target_price["baseTarget"] > snapshot.close
+    assert target_price["aggressiveTarget"] >= target_price["baseTarget"]
+    assert target_price["stopLoss"] < snapshot.close
+    trade_plan = evaluation.trade_plan_payload()
+    assert trade_plan["closeSignal"] in {"watchlist", "conditional_entry", "entry_wait"}
+    assert trade_plan["nextSessionPlan"]
+    assert trade_plan["entry"]["openGapRule"]
+    assert trade_plan["entry"]["invalidateRule"]
+
+
+def test_hot_close_signal_requires_next_session_confirmation() -> None:
+    evaluation = evaluate_snapshot(
+        make_snapshot(
+            "100012",
+            close=11_600.0,
+            high=11_800.0,
+            low=10_900.0,
+            open_price=11_000.0,
+            turnover_ratio_20d=8.5,
+            volume_ratio_20d=6.0,
+            return_3d_pct=12.0,
+        ),
+        generated_at=datetime.now(timezone.utc),
+    )
+
+    assert evaluation is not None
+    trade_plan = evaluation.trade_plan_payload()
+    assert trade_plan["closeSignal"] == "entry_wait"
+    assert trade_plan["entryMode"] == "pullback_reclaim"
+    assert trade_plan["entry"]["maxOpenGapPct"] == 3.0
 
 
 def test_warning_and_heat_signals_apply_heavy_penalty() -> None:
@@ -84,6 +121,20 @@ def test_warning_and_heat_signals_apply_heavy_penalty() -> None:
     assert risky.breakdown.risk_penalty <= -20.0
     assert risky.score < baseline.score
     assert risky.risk_flags
+
+
+def test_bear_market_regime_reduces_score() -> None:
+    baseline = evaluate_snapshot(make_snapshot("100010"), generated_at=datetime.now(timezone.utc))
+    bear_market = evaluate_snapshot(
+        make_snapshot("100011", market_regime="bear"),
+        generated_at=datetime.now(timezone.utc),
+    )
+
+    assert baseline is not None
+    assert bear_market is not None
+    assert bear_market.breakdown.risk_penalty <= -12.0
+    assert bear_market.score < baseline.score
+    assert any("시장 레짐" in item for item in bear_market.risk_flags)
 
 
 def test_universe_filter_rejects_low_liquidity_and_new_listing() -> None:

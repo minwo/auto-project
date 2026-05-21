@@ -21,7 +21,6 @@ app/
   repository.py
   scoring.py
   settings.py
-  ui.py
 docs/
   implementation-notes.md
   실데이터-연동-상세계획.md
@@ -40,6 +39,19 @@ uvicorn app.main:app --reload
 pytest
 ```
 
+## Next.js Frontend
+
+FastAPI 백엔드를 `8000`번 포트에 띄운 뒤 Next.js 프론트엔드를 실행합니다.
+
+```bash
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+cd frontend
+npm install
+npm run dev
+```
+
+브라우저에서 `http://127.0.0.1:3000`을 열면 반응형 후보 대시보드를 볼 수 있습니다. Next.js는 `/api/*` 요청을 기본적으로 `http://127.0.0.1:8000`으로 프록시합니다. 다른 백엔드 주소를 쓰려면 `NEXT_PUBLIC_API_BASE_URL`을 설정하세요.
+
 ## Database Modes
 
 기본값은 `실데이터 미연결` 모드입니다.
@@ -53,13 +65,18 @@ pytest
 ```env
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/domestic_stock_mvp
 POSTGRES_ADMIN_URL=postgresql://postgres:postgres@localhost:5432/postgres
-KIS_BASE_URL=https://openapi.koreainvestment.com:9443
-KIS_TOKEN_PATH=/oauth2/tokenP
-KIS_APP_KEY=
-KIS_APP_SECRET=
-KIS_DAILY_PRICE_API_PATH=/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice
-KIS_DAILY_PRICE_TR_ID=FHKST03010100
-KIS_CUSTOMER_TYPE=P
+KIWOOM_BASE_URL=https://api.kiwoom.com
+KIWOOM_TOKEN_PATH=/oauth2/token
+KIWOOM_APP_KEY=
+KIWOOM_SECRET_KEY=
+KIWOOM_DAILY_CHART_API_PATH=/api/dostk/chart
+KIWOOM_DAILY_CHART_API_ID=ka10081
+KIWOOM_DAILY_CHART_DATE_FIELD=base_dt
+KIWOOM_DAILY_CHART_QUERY_TYPE_FIELD=
+KIWOOM_DAILY_CHART_QUERY_TYPE=
+KIWOOM_DAILY_CHART_ADJUSTED_PRICE_FIELD=upd_stkpc_tp
+KIWOOM_DAILY_CHART_ADJUSTED_PRICE=1
+KIWOOM_EXCHANGE_SUFFIX=
 ```
 
 테이블 생성은 [sql/schema.sql](/D:/git/auto-project/sql/schema.sql:1)을 사용하면 됩니다.
@@ -95,35 +112,85 @@ python -m app.scripts.load_krx_master
 python -m app.scripts.check_db
 ```
 
-## Korea Investment Open API
+## Kiwoom REST API
 
-국내주식 일봉 시세는 한국투자 Open API 경로를 기준으로 연결할 수 있습니다.
+국내주식 일봉 시세는 키움 REST API 경로를 기준으로 연결할 수 있습니다.
 
 실행:
 
 ```bash
-python -m app.scripts.load_kis_daily_prices --code 005930 --from-date 20260401 --to-date 20260424
+python -m app.scripts.load_kiwoom_daily_prices --code 005930 --date 20260429
 python -m app.scripts.check_db
+```
+
+여러 종목을 한 번에 적재하려면 다음 스크립트를 사용합니다.
+
+```bash
+python -m app.scripts.load_kiwoom_daily_prices_many --codes 005930,000660,035420 --date 20260429
+python -m app.scripts.load_kiwoom_daily_prices_many --codes-file data/stock_codes.txt --date 20260429
+python -m app.scripts.load_kiwoom_daily_prices_many --from-master --market KOSPI --market KOSDAQ --limit 100 --date 20260429
+```
+
+`--codes-file`은 공백, 쉼표, `#` 주석을 허용합니다. `--from-master`는 `stock_master`의 보통주 유니버스를 읽어 `daily_prices`에 순차 적재합니다.
+공공데이터 마스터 승인 전에는 코드 파일의 주석을 종목명으로 동기화할 수 있습니다.
+
+```bash
+python -m app.scripts.sync_stock_names_from_codes --file data/stock_codes.txt
 ```
 
 필요한 환경변수:
 
-- `KIS_APP_KEY`
-- `KIS_APP_SECRET`
-- `KIS_BASE_URL`
-- `KIS_TOKEN_PATH`
-- `KIS_DAILY_PRICE_API_PATH`
-- `KIS_DAILY_PRICE_TR_ID`
+- `KIWOOM_APP_KEY`
+- `KIWOOM_SECRET_KEY`
+- `KIWOOM_BASE_URL`
+- `KIWOOM_TOKEN_PATH`
+- `KIWOOM_DAILY_CHART_API_PATH`
+- `KIWOOM_DAILY_CHART_API_ID`
 
 공식 참고:
 
-- 한국투자 Open API 포털: https://apiportal.koreainvestment.com/
-- 공식 예제 저장소: https://github.com/koreainvestment/open-trading-api
+- 키움 REST API 포털: https://openapi.kiwoom.com/
+- 키움 API 가이드: https://openapi.kiwoom.com/guide/apiguide
+- 키움 모바일 가이드: https://openapi.kiwoom.com/m/guide/apiguide
 
 참고:
 
 - 현재 스크립트는 일봉 시세 적재에 집중한 최소 구현입니다.
-- `KIS_DAILY_PRICE_TR_ID`와 요청 파라미터는 한국투자 공식 예제 기준으로 맞췄고, 계정 유형에 따라 조정이 필요하면 `.env`에서 바꿀 수 있게 열어뒀습니다.
+- 키움 차트 API는 `POST /api/dostk/chart`, 토큰 API는 `POST /oauth2/token`을 사용합니다.
+- `KIWOOM_DAILY_CHART_*` 필드는 계정 환경에 맞게 `.env`에서 조정할 수 있게 열어뒀습니다.
+
+## Daily Batch
+
+`daily_prices`에 실데이터가 적재된 뒤에는 점수 배치를 별도로 실행할 수 있습니다.
+
+```bash
+python -m app.scripts.run_daily_batch --date 2026-04-24
+python -m app.scripts.run_daily_batch --date 2026-04-24 --min-score 30 --limit 10
+python -m app.scripts.check_db
+```
+
+동작:
+
+- `daily_prices` 최근 이력으로 20일 평균 거래대금/거래량 계산
+- 3거래일 수익률, 종가 강도, 섹터 동조성 계산
+- 같은 날짜의 `daily_disclosures`, `daily_market_warnings`가 있으면 촉매/리스크 반영
+- 결과를 `daily_candidate_scores`에 저장
+
+## Open DART Disclosures
+
+공시 촉매 점수를 반영하려면 먼저 DART 고유번호를 종목 마스터에 매핑한 뒤 날짜별 공시를 적재합니다.
+
+```bash
+python -m app.scripts.load_dart_corp_codes
+python -m app.scripts.load_dart_disclosures --date 2026-04-29
+python -m app.scripts.run_daily_batch --date 2026-04-29 --min-score 30
+```
+
+필요한 환경변수:
+
+- `DART_API_KEY`
+
+`load_dart_corp_codes`는 Open DART `corpCode.xml`을 받아 `stock_master.dart_corp_code`를 업데이트합니다. `load_dart_disclosures`는 해당 날짜의 공시 목록을 받아 현재 `stock_master`에 존재하는 종목만 `daily_disclosures`에 저장합니다.
 
 관련 공식 참고:
 

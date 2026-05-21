@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
-from app.collectors.kis_open_api import DailyPriceRecord
+from app.batch import DisclosureRow, NewsRow, PriceHistoryRow, WarningRow
+from app.collectors.dart_open_api import DartCorpCodeRecord, DartDisclosureRecord
+from app.collectors.kiwoom_open_api import DailyPriceRecord
 from app.collectors.krx_master import StockMasterRecord
+from app.collectors.market_warnings import MarketWarningRecord
+from app.collectors.naver_news import NaverNewsRecord
 from app.domain import CandidateEvaluation, CatalystItem, DisclosureLink, NewsLink, ScoreBreakdown, StockSnapshot
-from app.repository import BacktestSummary, CandidateRepository
+from app.price_validation import validate_ohlc
+from app.repository import BacktestSummary, CandidateRepository, DailyTopPick, PriceChartPoint
 
 try:  # pragma: no cover
     import psycopg
@@ -38,11 +43,13 @@ class PostgresCandidateRepository(CandidateRepository):
         return bool(row)
 
     def table_counts(self) -> dict[str, int]:
+        self._ensure_daily_news_table()
         counts: dict[str, int] = {}
         table_names = [
             "stock_master",
             "daily_prices",
             "daily_disclosures",
+            "daily_news",
             "daily_market_warnings",
             "daily_candidate_scores",
             "backtest_summaries",
@@ -53,6 +60,51 @@ class PostgresCandidateRepository(CandidateRepository):
                 row = cur.fetchone()
                 counts[table_name] = int(row["count"]) if row else 0
         return counts
+
+    def _ensure_daily_top_pick_table(self) -> None:
+        sql = """
+            CREATE TABLE IF NOT EXISTS daily_top_score_picks (
+                pick_date DATE PRIMARY KEY,
+                code VARCHAR(12) NOT NULL REFERENCES stock_master(code),
+                name VARCHAR(120) NOT NULL,
+                sector VARCHAR(120) NOT NULL,
+                total_score NUMERIC(5, 2) NOT NULL,
+                base_close NUMERIC(18, 4) NOT NULL,
+                reasons_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                risk_flags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql)
+            conn.commit()
+
+    def _ensure_daily_news_table(self) -> None:
+        sql = """
+            CREATE TABLE IF NOT EXISTS daily_news (
+                trade_date DATE NOT NULL,
+                code VARCHAR(12) NOT NULL REFERENCES stock_master(code),
+                news_id VARCHAR(64) NOT NULL,
+                title VARCHAR(500) NOT NULL,
+                url TEXT NOT NULL,
+                source VARCHAR(64) NOT NULL,
+                published_at TIMESTAMPTZ,
+                summary TEXT,
+                news_type VARCHAR(64),
+                trust_score NUMERIC(4, 2) NOT NULL DEFAULT 0.50,
+                ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (trade_date, code, news_id)
+            )
+        """
+        index_sql = """
+            CREATE INDEX IF NOT EXISTS idx_daily_news_code_date
+            ON daily_news (code, trade_date DESC)
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql)
+            cur.execute(index_sql)
+            conn.commit()
 
     @staticmethod
     def _ensure_json(value: Any) -> Any:
@@ -74,10 +126,15 @@ class PostgresCandidateRepository(CandidateRepository):
         payload.pop("upper_wick_ratio", None)
         payload.pop("gap_up_pct", None)
         payload.pop("intraday_range_pct", None)
+        payload.pop("is_bullish", None)
+        payload.pop("body_ratio", None)
+        payload.pop("lower_wick_ratio", None)
         payload["date"] = date.fromisoformat(payload["date"])
         payload["catalysts"] = catalysts
         payload["news_links"] = news_links
         payload["disclosure_links"] = disclosure_links
+        if "open_price" not in payload:
+            payload["open_price"] = payload.get("prev_close", payload.get("close", 0.0))
         return StockSnapshot(**payload)
 
     @classmethod
@@ -101,8 +158,18 @@ class PostgresCandidateRepository(CandidateRepository):
         )
 
     @staticmethod
+    def _json_ready(value: Any) -> Any:
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, list):
+            return [PostgresCandidateRepository._json_ready(item) for item in value]
+        if isinstance(value, dict):
+            return {key: PostgresCandidateRepository._json_ready(item) for key, item in value.items()}
+        return value
+
+    @staticmethod
     def _snapshot_json(snapshot: StockSnapshot) -> dict[str, Any]:
-        return snapshot.raw_features()
+        return PostgresCandidateRepository._json_ready(snapshot.raw_features())
 
     @staticmethod
     def _price_stats_json(evaluation: CandidateEvaluation) -> dict[str, Any]:
@@ -283,13 +350,20 @@ class PostgresCandidateRepository(CandidateRepository):
                 source = EXCLUDED.source,
                 ingested_at = NOW()
         """
-        estimated_open = snapshot.prev_close if snapshot.prev_close > 0 else snapshot.low
+        open_price = snapshot.open_price if snapshot.open_price > 0 else snapshot.prev_close
+        validate_ohlc(
+            open_price=open_price,
+            high_price=snapshot.high,
+            low_price=snapshot.low,
+            close_price=snapshot.close,
+            context=f"score_batch {snapshot.code} {snapshot.date.isoformat()}",
+        )
         cur.execute(
             sql,
             {
                 "trade_date": snapshot.date,
                 "code": snapshot.code,
-                "open_price": estimated_open,
+                "open_price": open_price,
                 "high_price": snapshot.high,
                 "low_price": snapshot.low,
                 "close_price": snapshot.close,
@@ -315,19 +389,25 @@ class PostgresCandidateRepository(CandidateRepository):
                 %(name_kr)s,
                 %(market)s,
                 %(sector)s,
-                'unknown',
-                TRUE,
+                %(security_type)s,
+                %(is_common_stock)s,
                 NOW()
             )
             ON CONFLICT (code) DO UPDATE
             SET
-                name_kr = COALESCE(NULLIF(EXCLUDED.name_kr, ''), stock_master.name_kr),
+                name_kr = CASE
+                    WHEN EXCLUDED.name_kr IS NULL OR EXCLUDED.name_kr = '' OR EXCLUDED.name_kr = EXCLUDED.code
+                    THEN stock_master.name_kr
+                    ELSE EXCLUDED.name_kr
+                END,
                 market = CASE
                     WHEN stock_master.market IN ('', 'UNKNOWN') AND EXCLUDED.market NOT IN ('', 'UNKNOWN')
                     THEN EXCLUDED.market
                     ELSE stock_master.market
                 END,
                 sector = COALESCE(EXCLUDED.sector, stock_master.sector),
+                security_type = EXCLUDED.security_type,
+                is_common_stock = EXCLUDED.is_common_stock,
                 updated_at = NOW()
         """
         price_sql = """
@@ -368,13 +448,22 @@ class PostgresCandidateRepository(CandidateRepository):
             return 0
         with self._connect() as conn, conn.cursor() as cur:
             for record in records:
+                validate_ohlc(
+                    open_price=record.open_price,
+                    high_price=record.high_price,
+                    low_price=record.low_price,
+                    close_price=record.close_price,
+                    context=f"{record.source} {record.code} {record.trade_date.isoformat()}",
+                )
                 cur.execute(
                     stock_sql,
                     {
                         "code": record.code,
                         "name_kr": record.name_kr or record.code,
-                        "market": record.market or "UNKNOWN",
-                        "sector": record.sector,
+                        "market": record.market or "KOSPI",
+                        "sector": record.sector or "Unclassified",
+                        "security_type": "index" if record.market == "INDEX" else "unknown",
+                        "is_common_stock": record.market != "INDEX",
                     },
                 )
                 cur.execute(
@@ -393,6 +482,380 @@ class PostgresCandidateRepository(CandidateRepository):
                 )
             conn.commit()
         return len(records)
+
+    def fetch_stock_codes_for_price_load(
+        self,
+        *,
+        markets: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[str]:
+        filters = [
+            "is_common_stock = TRUE",
+            "is_preferred = FALSE",
+            "is_etf = FALSE",
+            "is_etn = FALSE",
+            "is_spac = FALSE",
+            "delisted_at IS NULL",
+        ]
+        params: dict[str, Any] = {}
+        if markets:
+            filters.append("market = ANY(%(markets)s)")
+            params["markets"] = markets
+
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT %(limit)s"
+            params["limit"] = limit
+
+        sql = f"""
+            SELECT code
+            FROM stock_master
+            WHERE {" AND ".join(filters)}
+            ORDER BY code ASC
+            {limit_sql}
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [row["code"] for row in rows]
+
+    def fetch_stock_news_targets(
+        self,
+        *,
+        codes: list[str] | None = None,
+        markets: list[str] | None = None,
+        limit: int | None = None,
+    ) -> list[tuple[str, str]]:
+        filters = [
+            "is_common_stock = TRUE",
+            "is_preferred = FALSE",
+            "is_etf = FALSE",
+            "is_etn = FALSE",
+            "is_spac = FALSE",
+            "delisted_at IS NULL",
+        ]
+        params: dict[str, Any] = {}
+        if codes:
+            filters.append("code = ANY(%(codes)s)")
+            params["codes"] = codes
+        if markets:
+            filters.append("market = ANY(%(markets)s)")
+            params["markets"] = markets
+
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT %(limit)s"
+            params["limit"] = limit
+
+        sql = f"""
+            SELECT code, name_kr
+            FROM stock_master
+            WHERE {" AND ".join(filters)}
+            ORDER BY code ASC
+            {limit_sql}
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        return [(row["code"], row["name_kr"]) for row in rows]
+
+    def update_stock_display_names(self, records: list[tuple[str, str]]) -> int:
+        sql = """
+            UPDATE stock_master
+            SET
+                name_kr = %(name_kr)s,
+                updated_at = NOW()
+            WHERE code = %(code)s
+        """
+        if not records:
+            return 0
+        updated = 0
+        with self._connect() as conn, conn.cursor() as cur:
+            for code, name_kr in records:
+                cur.execute(sql, {"code": code, "name_kr": name_kr})
+                updated += cur.rowcount
+            conn.commit()
+        return updated
+
+    def upsert_manual_stock_records(self, records: list[tuple[str, str]]) -> int:
+        sql = """
+            INSERT INTO stock_master (
+                code,
+                name_kr,
+                market,
+                sector,
+                security_type,
+                is_common_stock,
+                updated_at
+            )
+            VALUES (
+                %(code)s,
+                %(name_kr)s,
+                'KOSDAQ',
+                'Unclassified',
+                'manual_alias',
+                TRUE,
+                NOW()
+            )
+            ON CONFLICT (code) DO UPDATE
+            SET
+                name_kr = CASE
+                    WHEN stock_master.name_kr = stock_master.code OR stock_master.name_kr = ''
+                    THEN EXCLUDED.name_kr
+                    ELSE stock_master.name_kr
+                END,
+                market = CASE
+                    WHEN stock_master.market IN ('', 'UNKNOWN')
+                    THEN EXCLUDED.market
+                    ELSE stock_master.market
+                END,
+                sector = COALESCE(stock_master.sector, EXCLUDED.sector),
+                updated_at = NOW()
+        """
+        if not records:
+            return 0
+        with self._connect() as conn, conn.cursor() as cur:
+            for code, name_kr in records:
+                cur.execute(sql, {"code": code, "name_kr": name_kr})
+            conn.commit()
+        return len(records)
+
+    def resolve_stock_codes(self, query: str, limit: int = 5) -> list[str]:
+        normalized = query.strip()
+        if not normalized:
+            return []
+        sql = """
+            SELECT code
+            FROM stock_master
+            WHERE code ILIKE %(pattern)s OR name_kr ILIKE %(pattern)s
+            ORDER BY
+                CASE
+                    WHEN code = %(query)s THEN 0
+                    WHEN name_kr = %(query)s THEN 1
+                    WHEN code ILIKE %(prefix)s THEN 2
+                    WHEN name_kr ILIKE %(prefix)s THEN 3
+                    ELSE 4
+                END,
+                code ASC
+            LIMIT %(limit)s
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                sql,
+                {
+                    "query": normalized,
+                    "pattern": f"%{normalized}%",
+                    "prefix": f"{normalized}%",
+                    "limit": limit,
+                },
+            )
+            rows = cur.fetchall()
+        return [row["code"] for row in rows]
+
+    def update_dart_corp_codes(self, records: list[DartCorpCodeRecord]) -> int:
+        sql = """
+            UPDATE stock_master
+            SET
+                dart_corp_code = %(dart_corp_code)s,
+                updated_at = NOW()
+            WHERE code = %(code)s
+        """
+        matched = 0
+        with self._connect() as conn, conn.cursor() as cur:
+            for record in records:
+                if not record.stock_code:
+                    continue
+                cur.execute(sql, {"code": record.stock_code, "dart_corp_code": record.corp_code})
+                matched += cur.rowcount
+            conn.commit()
+        return matched
+
+    def upsert_daily_disclosure_records(self, records: list[DartDisclosureRecord]) -> int:
+        sql = """
+            INSERT INTO daily_disclosures (
+                trade_date,
+                code,
+                receipt_no,
+                report_name,
+                report_type,
+                disclosed_at,
+                url,
+                is_material,
+                material_tag
+            )
+            VALUES (
+                %(trade_date)s,
+                %(code)s,
+                %(receipt_no)s,
+                %(report_name)s,
+                %(report_type)s,
+                %(disclosed_at)s,
+                %(url)s,
+                %(is_material)s,
+                %(material_tag)s
+            )
+            ON CONFLICT (trade_date, code, receipt_no) DO UPDATE
+            SET
+                report_name = EXCLUDED.report_name,
+                report_type = EXCLUDED.report_type,
+                disclosed_at = EXCLUDED.disclosed_at,
+                url = EXCLUDED.url,
+                is_material = EXCLUDED.is_material,
+                material_tag = EXCLUDED.material_tag,
+                ingested_at = NOW()
+        """
+        if not records:
+            return 0
+        inserted = 0
+        with self._connect() as conn, conn.cursor() as cur:
+            for record in records:
+                cur.execute(
+                    "SELECT 1 FROM stock_master WHERE code = %(code)s",
+                    {"code": record.code},
+                )
+                if cur.fetchone() is None:
+                    continue
+                cur.execute(
+                    sql,
+                    {
+                        "trade_date": record.trade_date,
+                        "code": record.code,
+                        "receipt_no": record.receipt_no,
+                        "report_name": record.report_name,
+                        "report_type": record.report_type,
+                        "disclosed_at": record.disclosed_at,
+                        "url": record.url,
+                        "is_material": record.is_material,
+                        "material_tag": record.material_tag,
+                    },
+                )
+                inserted += 1
+            conn.commit()
+        return inserted
+
+    def upsert_daily_news_records(self, records: list[NaverNewsRecord]) -> int:
+        self._ensure_daily_news_table()
+        sql = """
+            INSERT INTO daily_news (
+                trade_date,
+                code,
+                news_id,
+                title,
+                url,
+                source,
+                published_at,
+                summary,
+                news_type,
+                trust_score
+            )
+            VALUES (
+                %(trade_date)s,
+                %(code)s,
+                %(news_id)s,
+                %(title)s,
+                %(url)s,
+                %(source)s,
+                %(published_at)s,
+                %(summary)s,
+                %(news_type)s,
+                %(trust_score)s
+            )
+            ON CONFLICT (trade_date, code, news_id) DO UPDATE
+            SET
+                title = EXCLUDED.title,
+                url = EXCLUDED.url,
+                source = EXCLUDED.source,
+                published_at = EXCLUDED.published_at,
+                summary = EXCLUDED.summary,
+                news_type = EXCLUDED.news_type,
+                trust_score = EXCLUDED.trust_score,
+                ingested_at = NOW()
+        """
+        if not records:
+            return 0
+        inserted = 0
+        with self._connect() as conn, conn.cursor() as cur:
+            for record in records:
+                cur.execute(
+                    "SELECT 1 FROM stock_master WHERE code = %(code)s",
+                    {"code": record.code},
+                )
+                if cur.fetchone() is None:
+                    continue
+                cur.execute(
+                    sql,
+                    {
+                        "trade_date": record.trade_date,
+                        "code": record.code,
+                        "news_id": record.news_id,
+                        "title": record.title,
+                        "url": record.url,
+                        "source": record.source,
+                        "published_at": record.published_at,
+                        "summary": record.summary,
+                        "news_type": record.news_type,
+                        "trust_score": record.trust_score,
+                    },
+                )
+                inserted += 1
+            conn.commit()
+        return inserted
+
+    def upsert_daily_market_warning_records(self, records: list[MarketWarningRecord]) -> int:
+        sql = """
+            INSERT INTO daily_market_warnings (
+                trade_date,
+                code,
+                warning_type,
+                warning_level,
+                is_halted,
+                is_under_management,
+                source_url
+            )
+            VALUES (
+                %(trade_date)s,
+                %(code)s,
+                %(warning_type)s,
+                %(warning_level)s,
+                %(is_halted)s,
+                %(is_under_management)s,
+                %(source_url)s
+            )
+            ON CONFLICT (trade_date, code) DO UPDATE
+            SET
+                warning_type = EXCLUDED.warning_type,
+                warning_level = EXCLUDED.warning_level,
+                is_halted = EXCLUDED.is_halted,
+                is_under_management = EXCLUDED.is_under_management,
+                source_url = EXCLUDED.source_url,
+                ingested_at = NOW()
+        """
+        if not records:
+            return 0
+        inserted = 0
+        with self._connect() as conn, conn.cursor() as cur:
+            for record in records:
+                cur.execute(
+                    "SELECT 1 FROM stock_master WHERE code = %(code)s",
+                    {"code": record.code},
+                )
+                if cur.fetchone() is None:
+                    continue
+                cur.execute(
+                    sql,
+                    {
+                        "trade_date": record.trade_date,
+                        "code": record.code,
+                        "warning_type": record.warning_type,
+                        "warning_level": record.warning_level,
+                        "is_halted": record.is_halted,
+                        "is_under_management": record.is_under_management,
+                        "source_url": record.source_url,
+                    },
+                )
+                inserted += 1
+            conn.commit()
+        return inserted
 
     def upsert_daily_scores(self, score_date: date, evaluations: list[CandidateEvaluation]) -> None:
         sql = """
@@ -543,6 +1006,20 @@ class PostgresCandidateRepository(CandidateRepository):
             )
             conn.commit()
 
+    def replace_daily_scores(self, score_date: date, evaluations: list[CandidateEvaluation]) -> None:
+        self._ensure_daily_top_pick_table()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM daily_candidate_scores WHERE score_date = %(score_date)s",
+                {"score_date": score_date},
+            )
+            cur.execute(
+                "DELETE FROM daily_top_score_picks WHERE pick_date = %(score_date)s",
+                {"score_date": score_date},
+            )
+            conn.commit()
+        self.upsert_daily_scores(score_date, evaluations)
+
     def get_daily_scores(self, score_date: date) -> list[CandidateEvaluation]:
         query = """
             SELECT
@@ -575,6 +1052,151 @@ class PostgresCandidateRepository(CandidateRepository):
         if not row:
             return None
         return row["latest_date"]
+
+    def latest_trade_date(self) -> date | None:
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT MAX(trade_date) AS latest_date FROM daily_prices")
+            row = cur.fetchone()
+        if not row:
+            return None
+        return row["latest_date"]
+
+    def available_trade_dates(self, limit: int = 260) -> list[date]:
+        sql = """
+            SELECT score_date
+            FROM daily_candidate_scores
+            GROUP BY score_date
+            HAVING COUNT(*) > 0
+            ORDER BY score_date DESC
+            LIMIT %(limit)s
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, {"limit": limit})
+            rows = cur.fetchall()
+        return [row["score_date"] for row in rows]
+
+    def fetch_price_history_for_batch(self, score_date: date, history_limit: int = 25) -> list[PriceHistoryRow]:
+        sql = """
+            WITH ranked_prices AS (
+                SELECT
+                    dp.trade_date,
+                    dp.code,
+                    dp.open_price,
+                    dp.high_price,
+                    dp.low_price,
+                    dp.close_price,
+                    dp.volume,
+                    dp.turnover,
+                    sm.name_kr,
+                    sm.market,
+                    COALESCE(sm.sector, 'Unclassified') AS sector,
+                    sm.listed_at,
+                    sm.is_common_stock,
+                    sm.is_preferred,
+                    sm.is_etf,
+                    sm.is_etn,
+                    sm.is_spac,
+                    ROW_NUMBER() OVER (PARTITION BY dp.code ORDER BY dp.trade_date DESC) AS rn
+                FROM daily_prices dp
+                JOIN stock_master sm ON sm.code = dp.code
+                WHERE dp.trade_date <= %(score_date)s
+            )
+            SELECT *
+            FROM ranked_prices
+            WHERE rn <= %(history_limit)s
+            ORDER BY code ASC, trade_date DESC
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, {"score_date": score_date, "history_limit": history_limit})
+            rows = cur.fetchall()
+        return [
+            PriceHistoryRow(
+                code=row["code"],
+                name=row["name_kr"],
+                market=row["market"],
+                sector=row["sector"],
+                listed_at=row["listed_at"],
+                is_common_stock=bool(row["is_common_stock"]),
+                is_preferred=bool(row["is_preferred"]),
+                is_etf=bool(row["is_etf"]),
+                is_etn=bool(row["is_etn"]),
+                is_spac=bool(row["is_spac"]),
+                trade_date=row["trade_date"],
+                open_price=float(row["open_price"]),
+                high_price=float(row["high_price"]),
+                low_price=float(row["low_price"]),
+                close_price=float(row["close_price"]),
+                volume=float(row["volume"]),
+                turnover=float(row["turnover"]),
+            )
+            for row in rows
+        ]
+
+    def fetch_market_warnings_for_date(self, score_date: date) -> list[WarningRow]:
+        sql = """
+            SELECT code, warning_level, is_halted, is_under_management
+            FROM daily_market_warnings
+            WHERE trade_date = %(score_date)s
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, {"score_date": score_date})
+            rows = cur.fetchall()
+        return [
+            WarningRow(
+                code=row["code"],
+                warning_level=row["warning_level"],
+                is_halted=bool(row["is_halted"]),
+                is_under_management=bool(row["is_under_management"]),
+            )
+            for row in rows
+        ]
+
+    def fetch_disclosures_for_date(self, score_date: date) -> list[DisclosureRow]:
+        sql = """
+            SELECT code, report_name, report_type, material_tag, url, is_material
+            FROM daily_disclosures
+            WHERE trade_date = %(score_date)s
+            ORDER BY code ASC, disclosed_at DESC NULLS LAST, receipt_no DESC
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, {"score_date": score_date})
+            rows = cur.fetchall()
+        return [
+            DisclosureRow(
+                code=row["code"],
+                report_name=row["report_name"],
+                report_type=row["report_type"],
+                material_tag=row["material_tag"],
+                url=row["url"],
+                is_material=bool(row["is_material"]),
+            )
+            for row in rows
+        ]
+
+    def fetch_news_for_date(self, score_date: date) -> list[NewsRow]:
+        self._ensure_daily_news_table()
+        sql = """
+            SELECT code, title, url, source, published_at, summary, news_type, trust_score
+            FROM daily_news
+            WHERE trade_date = %(score_date)s
+            ORDER BY code ASC, published_at DESC NULLS LAST, title ASC
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, {"score_date": score_date})
+            rows = cur.fetchall()
+        return [
+            NewsRow(
+                code=row["code"],
+                title=row["title"],
+                url=row["url"],
+                source=row["source"],
+                published_at=row["published_at"],
+                summary=row["summary"],
+                news_type=row["news_type"],
+                trust_score=float(row["trust_score"]),
+            )
+            for row in rows
+        ]
 
     def search_daily_scores(self, score_date: date, query: str = "", limit: int = 30) -> list[CandidateEvaluation]:
         normalized = query.strip()
@@ -666,6 +1288,204 @@ class PostgresCandidateRepository(CandidateRepository):
             sector_concentration=float(row["sector_concentration"]),
             warning_hit_rate=float(row["warning_hit_rate"]),
         )
+
+    def get_price_chart(self, code: str, to_date: date, limit: int = 60) -> list[PriceChartPoint]:
+        sql = """
+            SELECT trade_date, open_price, high_price, low_price, close_price, volume
+            FROM daily_prices
+            WHERE code = %(code)s
+              AND trade_date <= %(to_date)s
+            ORDER BY trade_date DESC
+            LIMIT %(limit)s
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, {"code": code, "to_date": to_date, "limit": limit})
+            rows = cur.fetchall()
+        return [
+            PriceChartPoint(
+                trade_date=row["trade_date"],
+                open_price=float(row["open_price"]),
+                high_price=float(row["high_price"]),
+                low_price=float(row["low_price"]),
+                close_price=float(row["close_price"]),
+                volume=float(row["volume"]),
+            )
+            for row in reversed(rows)
+        ]
+
+    def refresh_daily_top_picks(self, as_of: date, retention_days: int = 92) -> list[DailyTopPick]:
+        self._ensure_daily_top_pick_table()
+        cutoff = as_of - timedelta(days=retention_days)
+        select_sql = """
+            SELECT
+                score_date,
+                code,
+                name,
+                sector,
+                total_score,
+                raw_features_json,
+                reasons_json,
+                risk_flags_json
+            FROM daily_candidate_scores
+            WHERE score_date >= %(cutoff)s
+              AND score_date <= %(as_of)s
+            ORDER BY score_date ASC, total_score DESC, code ASC
+        """
+        insert_sql = """
+            INSERT INTO daily_top_score_picks (
+                pick_date,
+                code,
+                name,
+                sector,
+                total_score,
+                base_close,
+                reasons_json,
+                risk_flags_json,
+                updated_at
+            )
+            VALUES (
+                %(pick_date)s,
+                %(code)s,
+                %(name)s,
+                %(sector)s,
+                %(total_score)s,
+                %(base_close)s,
+                %(reasons_json)s,
+                %(risk_flags_json)s,
+                NOW()
+            )
+            ON CONFLICT (pick_date) DO UPDATE
+            SET
+                code = EXCLUDED.code,
+                name = EXCLUDED.name,
+                sector = EXCLUDED.sector,
+                total_score = EXCLUDED.total_score,
+                base_close = EXCLUDED.base_close,
+                reasons_json = EXCLUDED.reasons_json,
+                risk_flags_json = EXCLUDED.risk_flags_json,
+                updated_at = NOW()
+        """
+        delete_window_sql = """
+            DELETE FROM daily_top_score_picks
+            WHERE pick_date >= %(cutoff)s AND pick_date <= %(as_of)s
+        """
+        delete_old_sql = "DELETE FROM daily_top_score_picks WHERE pick_date < %(cutoff)s"
+
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(select_sql, {"cutoff": cutoff, "as_of": as_of})
+            rows = cur.fetchall()
+
+            picks_by_date: dict[date, dict[str, Any]] = {}
+            active_codes: set[str] = set()
+
+            for row in rows:
+                score_date = row["score_date"]
+                code = row["code"]
+                if code in active_codes:
+                    continue
+                if score_date in picks_by_date:
+                    continue
+
+                raw_features = self._ensure_json(row["raw_features_json"]) or {}
+                picks_by_date[score_date] = {
+                    "pick_date": score_date,
+                    "code": code,
+                    "name": row["name"],
+                    "sector": row["sector"],
+                    "total_score": row["total_score"],
+                    "base_close": float(raw_features.get("close", 0.0) or 0.0),
+                    "reasons_json": Jsonb(self._ensure_json(row["reasons_json"]) or []),
+                    "risk_flags_json": Jsonb(self._ensure_json(row["risk_flags_json"]) or []),
+                }
+                active_codes.add(code)
+
+            cur.execute(delete_window_sql, {"cutoff": cutoff, "as_of": as_of})
+            for pick in picks_by_date.values():
+                cur.execute(insert_sql, pick)
+            cur.execute(delete_old_sql, {"cutoff": cutoff})
+            conn.commit()
+        return self.get_daily_top_picks(as_of=as_of, retention_days=retention_days)
+
+    def get_daily_top_picks(self, as_of: date, retention_days: int = 92) -> list[DailyTopPick]:
+        self._ensure_daily_top_pick_table()
+        cutoff = as_of - timedelta(days=retention_days)
+        sql = """
+            SELECT
+                pick.pick_date,
+                pick.code,
+                pick.name,
+                pick.sector,
+                pick.total_score,
+                pick.base_close,
+                pick.reasons_json,
+                pick.risk_flags_json,
+                score.raw_features_json,
+                COALESCE(latest_recommendation.score_date, pick.pick_date) AS recommendation_end_date,
+                COALESCE(latest_price.trade_date, pick.pick_date) AS latest_date,
+                COALESCE(latest_price.close_price, pick.base_close) AS latest_close
+            FROM daily_top_score_picks pick
+            LEFT JOIN daily_candidate_scores score
+              ON score.score_date = pick.pick_date
+             AND score.code = pick.code
+            LEFT JOIN LATERAL (
+                SELECT score_date
+                FROM daily_candidate_scores recommendation
+                WHERE recommendation.code = pick.code
+                  AND recommendation.score_date >= pick.pick_date
+                  AND recommendation.score_date <= %(as_of)s
+                ORDER BY recommendation.score_date DESC
+                LIMIT 1
+            ) latest_recommendation ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT trade_date, close_price
+                FROM daily_prices price
+                WHERE price.code = pick.code
+                  AND price.trade_date >= pick.pick_date
+                  AND price.trade_date <= %(as_of)s
+                ORDER BY price.trade_date DESC
+                LIMIT 1
+            ) latest_price ON TRUE
+            WHERE pick.pick_date >= %(cutoff)s
+              AND pick.pick_date <= %(as_of)s
+            ORDER BY pick.pick_date DESC
+        """
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, {"cutoff": cutoff, "as_of": as_of})
+            rows = cur.fetchall()
+        picks: list[DailyTopPick] = []
+        for row in rows:
+            base_close = float(row["base_close"])
+            latest_close = float(row["latest_close"])
+            change_pct = 0.0 if base_close <= 0 else ((latest_close - base_close) / base_close) * 100.0
+            raw_features = self._ensure_json(row["raw_features_json"]) or {}
+            picks.append(
+                DailyTopPick(
+                    pick_date=row["pick_date"],
+                    recommendation_end_date=row["recommendation_end_date"],
+                    code=row["code"],
+                    name=row["name"],
+                    sector=row["sector"],
+                    score=float(row["total_score"]),
+                    base_close=base_close,
+                    latest_date=row["latest_date"],
+                    latest_close=latest_close,
+                    change_pct=change_pct,
+                    reasons=self._ensure_json(row["reasons_json"]) or [],
+                    risk_flags=self._ensure_json(row["risk_flags_json"]) or [],
+                    market_regime=raw_features.get("market_regime", "neutral"),
+                    market_regime_source=raw_features.get("market_regime_source", "breadth"),
+                    market_index_name=raw_features.get("market_index_name"),
+                    market_index_close=float(raw_features.get("market_index_close", 0.0) or 0.0),
+                    market_index_return_pct=float(raw_features.get("market_index_return_pct", 0.0) or 0.0),
+                    market_index_return_5d_pct=float(raw_features.get("market_index_return_5d_pct", 0.0) or 0.0),
+                    market_index_return_20d_pct=float(raw_features.get("market_index_return_20d_pct", 0.0) or 0.0),
+                    market_index_return_60d_pct=float(raw_features.get("market_index_return_60d_pct", 0.0) or 0.0),
+                    market_short_trend=raw_features.get("market_short_trend", "neutral"),
+                    market_mid_trend=raw_features.get("market_mid_trend", "neutral"),
+                    market_long_trend=raw_features.get("market_long_trend", "neutral"),
+                )
+            )
+        return picks
 
 
 def create_postgres_repository(database_url: str) -> PostgresCandidateRepository:

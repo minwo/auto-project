@@ -7,6 +7,9 @@ from app.settings import load_settings
 
 def scalar_count(conn: psycopg.Connection, table_name: str) -> int:
     with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (table_name,))
+        if cur.fetchone()[0] is None:
+            return 0
         cur.execute(f"SELECT COUNT(*) FROM {table_name}")
         row = cur.fetchone()
     return int(row[0]) if row else 0
@@ -23,6 +26,7 @@ def main() -> None:
             "stock_master",
             "daily_prices",
             "daily_disclosures",
+            "daily_news",
             "daily_market_warnings",
             "daily_candidate_scores",
             "backtest_summaries",

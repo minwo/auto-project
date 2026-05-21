@@ -1,0 +1,4 @@
+# Manual aliases used before public stock master data is connected.
+# Format: code # Korean stock name
+247540 # 에코프로비엠
+440110 # 파두

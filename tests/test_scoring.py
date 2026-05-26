@@ -4,7 +4,7 @@ from datetime import date, datetime, timezone
 
 from app.domain import CatalystItem, StockSnapshot
 from app.repository import select_top_candidates
-from app.scoring import evaluate_snapshot
+from app.scoring import DEFAULT_CONFIG, config_for_market_regime, evaluate_snapshot
 
 
 def make_snapshot(
@@ -135,6 +135,19 @@ def test_bear_market_regime_reduces_score() -> None:
     assert bear_market.breakdown.risk_penalty <= -12.0
     assert bear_market.score < baseline.score
     assert any("시장 레짐" in item for item in bear_market.risk_flags)
+
+
+def test_market_regime_config_changes_factor_weights() -> None:
+    bull_config = config_for_market_regime("strong")
+    weak_config = config_for_market_regime("weak")
+    bear_config = config_for_market_regime("bear")
+
+    assert bull_config.catalyst_kind_weights["news"] > DEFAULT_CONFIG.catalyst_kind_weights["news"]
+    assert bull_config.liquidity_turnover_mult > DEFAULT_CONFIG.liquidity_turnover_mult
+    assert weak_config.close_base_mult > DEFAULT_CONFIG.close_base_mult
+    assert weak_config.risk_gap_up_penalty > DEFAULT_CONFIG.risk_gap_up_penalty
+    assert bear_config.catalyst_kind_weights["news"] < DEFAULT_CONFIG.catalyst_kind_weights["news"]
+    assert bear_config.risk_gap_up_threshold < DEFAULT_CONFIG.risk_gap_up_threshold
 
 
 def test_universe_filter_rejects_low_liquidity_and_new_listing() -> None:

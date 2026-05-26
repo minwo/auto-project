@@ -100,6 +100,7 @@ export function formatSector(value: string | null | undefined) {
 
 export function profileLabel(value: string | null | undefined) {
   if (value === "surge") return "급등형";
+  if (value === "pullback") return "눌림형";
   if (value === "trend") return "추세형";
   return "안정형";
 }

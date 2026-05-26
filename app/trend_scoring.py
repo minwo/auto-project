@@ -68,7 +68,10 @@ def _liquidity_score(snapshot: StockSnapshot, rows_desc: list[PriceHistoryRow]) 
         reasons.append("20일 평균 거래대금이 30억원 이상으로 추세 매매 유동성이 확보됐습니다.")
     elif snapshot.avg_turnover_20d >= 1_000_000_000:
         score += 8.0
-        reasons.append("20일 평균 거래대금이 추세 추적 최소 기준을 충족합니다.")
+        reasons.append("20일 평균 거래대금이 추세 추적 기준을 충족합니다.")
+    elif snapshot.avg_turnover_20d >= 300_000_000:
+        score += 5.0
+        reasons.append("20일 평균 거래대금이 최소 기준을 충족합니다. 유동성 확인이 필요합니다.")
 
     obv_tail = _obv_values(rows_desc)[-20:]
     if len(obv_tail) >= 10 and _linear_slope(obv_tail) > 0:
@@ -226,7 +229,7 @@ def evaluate_trend_snapshot(
         return None
     if snapshot.is_under_management or snapshot.is_trading_halted or snapshot.listed_days < 90:
         return None
-    if snapshot.avg_turnover_20d < 1_000_000_000 or len(rows_desc) < 60:
+    if snapshot.avg_turnover_20d < 300_000_000 or len(rows_desc) < 60:
         return None
 
     profile_snapshot = replace(snapshot, candidate_profile="trend")

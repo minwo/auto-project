@@ -431,7 +431,13 @@ class CandidateEvaluation:
         close_signal = "watchlist"
         close_signal_label = "관심 후보"
         next_session_plan = "익일 장 초반 가격/거래대금 확인 후 조건부 진입"
-        if self.snapshot.day_change_pct >= 15.0 or self.snapshot.turnover_ratio_20d >= 8.0:
+        if self.snapshot.candidate_profile == "pullback":
+            max_open_gap_pct = 2.5
+            entry_mode = "pullback_reversal"
+            close_signal = "conditional_entry" if self.score >= 60.0 else "entry_wait"
+            close_signal_label = "눌림 확인"
+            next_session_plan = "추격 매수보다 전일 저가 이탈 여부와 장 초반 고가/VWAP 회복을 확인합니다."
+        elif self.snapshot.day_change_pct >= 15.0 or self.snapshot.turnover_ratio_20d >= 8.0:
             max_open_gap_pct = 3.0
             entry_mode = "pullback_reclaim"
             close_signal = "entry_wait"

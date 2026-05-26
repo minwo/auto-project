@@ -647,6 +647,11 @@ button {
   background: #fee2e2;
 }
 
+.profile-pill.pullback {
+  color: #0f766e;
+  background: #ccfbf1;
+}
+
 .profile-pill.trend {
   color: #047857;
   background: #d1fae5;

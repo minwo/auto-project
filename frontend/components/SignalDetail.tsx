@@ -74,6 +74,17 @@ function scoreMaxForProfile(profile: string | undefined) {
       totalScore: 100,
     };
   }
+  if (profile === "pullback") {
+    return {
+      liquidityScore: 15,
+      closeStrengthScore: 20,
+      catalystScore: 10,
+      sectorScore: 25,
+      continuityScore: 25,
+      riskPenalty: 35,
+      totalScore: 100,
+    };
+  }
   return scoreMaxValues;
 }
 
@@ -94,6 +105,15 @@ function scoreLabelsForProfile(profile: string | undefined) {
       catalyst: "중장기 촉매",
       sector: "시장/섹터",
       continuity: "추세 지속성",
+    };
+  }
+  if (profile === "pullback") {
+    return {
+      liquidity: "눌림 유동성",
+      close: "반등 캔들",
+      catalyst: "보조 재료",
+      sector: "장기 추세",
+      continuity: "눌림 깊이",
     };
   }
   return {

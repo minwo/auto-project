@@ -254,6 +254,16 @@ class UnavailableRepository(CandidateRepository):
         self.database_configured = database_configured
 
 
+def _classify_liquidity_tier(evaluation: CandidateEvaluation) -> str:
+    """avg_turnover_20d 기준 유동성 티어 분류."""
+    avg_turnover = evaluation.snapshot.avg_turnover_20d
+    if avg_turnover >= 10_000_000_000:  # 100억 이상
+        return "large"
+    if avg_turnover >= 3_000_000_000:  # 30억 이상
+        return "mid"
+    return "small"
+
+
 def select_top_candidates(
     evaluations: list[CandidateEvaluation],
     min_score: float = 60.0,
@@ -263,6 +273,7 @@ def select_top_candidates(
     separate_profiles: bool = False,
     carry_forward_codes: set[str] | None = None,
     trend_keep_limit: int = 6,
+    max_per_tier: int = 5,
 ) -> list[CandidateEvaluation]:
     regime_min_score = {
         "bear": max(min_score, 72.0),
@@ -274,12 +285,15 @@ def select_top_candidates(
 
     selected: list[CandidateEvaluation] = []
     per_sector: dict[tuple[str, str], int] = defaultdict(int)
+    per_tier: dict[str, int] = defaultdict(int)
     selected_codes: set[str] = set()
 
     def profile_min_score(evaluation: CandidateEvaluation) -> float:
         profile_key = evaluation.snapshot.candidate_profile if separate_profiles else "all"
         if profile_key == "trend":
             return max(45.0, effective_min - 15.0)
+        if profile_key == "pullback":
+            return max(52.0, effective_min - 8.0)
         return effective_min
 
     def append_if_allowed(evaluation: CandidateEvaluation) -> bool:
@@ -293,9 +307,13 @@ def select_top_candidates(
         sector_key = (profile_key, evaluation.snapshot.sector)
         if per_sector[sector_key] >= max_per_sector:
             return False
+        tier = _classify_liquidity_tier(evaluation)
+        if per_tier[tier] >= max_per_tier:
+            return False
         selected.append(evaluation)
         selected_codes.add(evaluation.snapshot.code)
         per_sector[sector_key] += 1
+        per_tier[tier] += 1
         return True
 
     if separate_profiles and carry_forward_codes:

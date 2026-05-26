@@ -7,6 +7,7 @@ from statistics import mean
 
 from app.domain import CandidateEvaluation, CatalystItem, DisclosureLink, NewsLink, StockSnapshot
 from app.repository import select_top_candidates
+from app.pullback_scoring import evaluate_pullback_snapshot
 from app.scoring import evaluate_snapshot
 from app.surge_scoring import evaluate_surge_snapshot
 from app.trend_scoring import evaluate_trend_snapshot
@@ -568,6 +569,13 @@ def evaluate_daily_batch_with_surge(
         )
         if surge is not None:
             evaluations.append(surge)
+        pullback = evaluate_pullback_snapshot(
+            snapshot,
+            histories_by_code.get(snapshot.code, []),
+            generated_at=generated_at,
+        )
+        if pullback is not None:
+            evaluations.append(pullback)
         trend = evaluate_trend_snapshot(
             snapshot,
             histories_by_code.get(snapshot.code, []),

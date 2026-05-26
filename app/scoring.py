@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from app.domain import CandidateEvaluation, ScoreBreakdown, StockSnapshot
@@ -63,6 +63,8 @@ class ScoringConfig:
     risk_bear_penalty: float = 12.0
     risk_weak_penalty: float = 6.0
     risk_strong_bonus: float = 3.0
+    risk_gap_up_threshold: float = 7.0
+    risk_gap_up_penalty: float = 6.0
     risk_max_penalty: float = -35.0
 
 
@@ -75,6 +77,82 @@ NEGATIVE_CATALYST_KINDS = {
 }
 
 DEFAULT_CONFIG = ScoringConfig()
+
+
+def _scaled_catalyst_weights(multiplier: float) -> dict[str, float]:
+    return {
+        kind: weight * multiplier
+        for kind, weight in DEFAULT_CONFIG.catalyst_kind_weights.items()
+    }
+
+
+NEUTRAL_CONFIG = replace(
+    DEFAULT_CONFIG,
+    liquidity_turnover_mult=13.0,
+    liquidity_volume_mult=7.5,
+    catalyst_kind_weights=_scaled_catalyst_weights(1.08),
+    catalyst_default_weight=3.2,
+)
+
+BULL_CONFIG = replace(
+    DEFAULT_CONFIG,
+    liquidity_turnover_mult=14.0,
+    liquidity_volume_mult=8.0,
+    liquidity_expansion_bonus=3.0,
+    catalyst_kind_weights=_scaled_catalyst_weights(1.2),
+    catalyst_default_weight=3.6,
+    sector_peers_mult=3.0,
+    sector_turnover_mult=6.0,
+    risk_strong_bonus=4.0,
+)
+
+WEAK_CONFIG = replace(
+    DEFAULT_CONFIG,
+    close_base_mult=18.0,
+    close_base_offset=5.0,
+    close_wick_penalty=8.0,
+    close_wick_threshold=0.3,
+    close_overheat_penalty=4.0,
+    close_bullish_bonus=3.0,
+    close_body_bonus_mult=2.5,
+    liquidity_exhaustion_penalty=4.0,
+    risk_weak_penalty=8.0,
+    risk_gap_up_threshold=5.0,
+    risk_gap_up_penalty=9.0,
+    risk_max_penalty=-40.0,
+)
+
+BEAR_CONFIG = replace(
+    WEAK_CONFIG,
+    close_base_mult=19.0,
+    close_wick_penalty=9.0,
+    liquidity_turnover_mult=10.0,
+    liquidity_volume_mult=6.0,
+    liquidity_expansion_bonus=1.0,
+    catalyst_kind_weights=_scaled_catalyst_weights(0.85),
+    catalyst_default_weight=2.5,
+    sector_peers_mult=2.0,
+    sector_turnover_mult=4.0,
+    risk_bear_penalty=14.0,
+    risk_gap_up_threshold=4.0,
+    risk_gap_up_penalty=12.0,
+    risk_max_penalty=-45.0,
+)
+
+
+def config_for_market_regime(market_regime: str | None) -> ScoringConfig:
+    """Return a scoring config tuned for the current market regime."""
+
+    regime = (market_regime or "neutral").lower()
+    if regime == "strong":
+        return BULL_CONFIG
+    if regime == "neutral":
+        return NEUTRAL_CONFIG
+    if regime == "weak":
+        return WEAK_CONFIG
+    if regime == "bear":
+        return BEAR_CONFIG
+    return DEFAULT_CONFIG
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -187,23 +265,39 @@ def _sector_score(snapshot: StockSnapshot, cfg: ScoringConfig) -> tuple[float, l
 
 def _continuity_score(snapshot: StockSnapshot, cfg: ScoringConfig) -> tuple[float, list[str]]:
     move_score = 0.0
-    if cfg.continuity_optimal_low <= snapshot.return_3d_pct <= cfg.continuity_optimal_high:
-        move_score = 7.0
-    elif cfg.continuity_optimal_high < snapshot.return_3d_pct <= cfg.continuity_moderate_high:
+    # 눌림목/초기 반등에 높은 점수, 이미 많이 오른 건 감점
+    if -3.0 <= snapshot.return_3d_pct < 0.0:
+        # 눌림목 반등 패턴: 소폭 하락 후 거래량 동반시 높은 점수
         move_score = 5.0
-    elif cfg.continuity_moderate_high < snapshot.return_3d_pct <= cfg.continuity_max_high:
+    elif 0.0 <= snapshot.return_3d_pct <= cfg.continuity_optimal_low:
+        # 초기 상승 단계
+        move_score = 7.0
+    elif cfg.continuity_optimal_low < snapshot.return_3d_pct <= 5.0:
+        # 적정 모멘텀 구간
+        move_score = 6.0
+    elif 5.0 < snapshot.return_3d_pct <= cfg.continuity_optimal_high:
+        # 모멘텀 진행 중이나 추격 위험 시작
+        move_score = 4.0
+    elif cfg.continuity_optimal_high < snapshot.return_3d_pct <= cfg.continuity_moderate_high:
+        # 과열 주의 구간
         move_score = 2.0
+    elif cfg.continuity_moderate_high < snapshot.return_3d_pct <= cfg.continuity_max_high:
+        move_score = 1.0
 
     lead_bonus = cfg.continuity_lead_bonus if snapshot.has_leading_move and snapshot.return_3d_pct <= cfg.continuity_moderate_high else 0.0
     score = _clamp(move_score + lead_bonus, 0.0, 10.0)
 
     reasons: list[str] = []
-    if move_score >= 5.0:
+    if -3.0 <= snapshot.return_3d_pct < 0.0:
+        reasons.append("최근 3거래일 소폭 눌림 후 반등 가능 구간입니다.")
+    elif move_score >= 5.0:
         reasons.append("최근 3거래일 추세 연속성이 유지되고 있습니다.")
     if lead_bonus > 0:
         reasons.append("급등 전 선행 움직임이 포착됐습니다.")
     if snapshot.return_3d_pct > cfg.continuity_max_high:
         reasons.append("최근 3거래일 상승률이 높아 추세 연속성 점수는 제한했습니다.")
+    if 5.0 < snapshot.return_3d_pct <= cfg.continuity_optimal_high:
+        reasons.append("단기 상승 폭이 커서 추격매수 위험이 있습니다.")
     return score, reasons
 
 
@@ -233,8 +327,8 @@ def _risk_penalty(snapshot: StockSnapshot, cfg: ScoringConfig) -> tuple[float, l
     if snapshot.upper_wick_ratio >= 0.4:
         penalty -= 6.0
         flags.append("긴 윗꼬리로 차익실현 압력이 보입니다.")
-    if snapshot.gap_up_pct >= 7.0:
-        penalty -= 6.0
+    if snapshot.gap_up_pct >= cfg.risk_gap_up_threshold:
+        penalty -= cfg.risk_gap_up_penalty
         flags.append("갭상승 폭이 커서 추격 위험이 있습니다.")
     if snapshot.intraday_range_pct >= 18.0:
         penalty -= 7.0
@@ -281,7 +375,7 @@ def evaluate_snapshot(
     generated_at: datetime | None = None,
     config: ScoringConfig | None = None,
 ) -> CandidateEvaluation | None:
-    cfg = config or DEFAULT_CONFIG
+    cfg = config or config_for_market_regime(snapshot.market_regime)
     eligible, exclusions = is_eligible(snapshot)
     if not eligible:
         return None

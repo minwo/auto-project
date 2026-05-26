@@ -372,6 +372,10 @@ def _risk_penalty(snapshot: StockSnapshot, rows_desc: list[PriceHistoryRow]) -> 
         penalty -= 12.0
         flags.append("희석/관리/재무 리스크성 공시가 확인됩니다.")
 
+    if snapshot.return_3d_pct >= 15.0 and snapshot.day_change_pct >= 10.0:
+        penalty -= 6.0
+        flags.append("3거래일 15% 이상 상승 + 당일 10% 이상으로 과열 추격 위험이 큽니다.")
+
     return max(penalty, -35.0), flags
 
 
@@ -407,7 +411,7 @@ def evaluate_surge_snapshot(
         return None
     if snapshot.is_under_management or snapshot.is_trading_halted or snapshot.listed_days < 60:
         return None
-    if snapshot.avg_turnover_20d < 1_000_000_000:
+    if snapshot.avg_turnover_20d < 500_000_000:
         return None
     if snapshot.day_change_pct < 3.0 or snapshot.volume_ratio_20d < 3.0:
         return None

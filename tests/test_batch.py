@@ -236,6 +236,58 @@ def test_evaluate_daily_batch_with_surge_adds_separate_trend_profile() -> None:
     assert trend[0].trade_plan_payload()["exit"]["maxHoldingDays"] == 60
 
 
+def test_evaluate_daily_batch_with_surge_adds_separate_pullback_profile() -> None:
+    score_date = date(2026, 4, 24)
+    rows = []
+    for offset in range(70):
+        trade_date = date.fromordinal(score_date.toordinal() - offset)
+        if offset == 0:
+            close_price = 92.0
+        elif offset <= 5:
+            close_price = 92.0 + offset * 1.6
+        else:
+            close_price = 100.0 - (offset - 5) * 0.45
+        rows.append(
+            make_price_row(
+                code="555555",
+                name="Pullback Leader",
+                trade_date=trade_date,
+                close_price=close_price,
+                turnover=2_600_000_000 if offset == 0 else 1_500_000_000,
+                volume=300_000 if offset == 0 else 220_000,
+                sector="Growth",
+            )
+        )
+
+    rows[0].open_price = 92.5
+    rows[0].high_price = 93.5
+    rows[0].low_price = 88.0
+
+    evaluations = evaluate_daily_batch_with_surge(
+        score_date=score_date,
+        price_rows=rows,
+        disclosure_rows=[
+            DisclosureRow(
+                code="555555",
+                report_name="single sales contract",
+                report_type="contract",
+                material_tag="contract",
+                url="https://example.com/contract",
+                is_material=True,
+            )
+        ],
+        generated_at=datetime.now(timezone.utc),
+    )
+
+    pullback = [item for item in evaluations if item.snapshot.candidate_profile == "pullback"]
+    selected = select_top_candidates(pullback, min_score=60.0, limit=10, separate_profiles=True)
+
+    assert pullback
+    assert pullback[0].score >= 52.0
+    assert pullback[0].trade_plan_payload()["entryMode"] == "pullback_reversal"
+    assert any(item.snapshot.candidate_profile == "pullback" for item in selected)
+
+
 def test_select_top_candidates_deduplicates_stable_and_surge_profiles() -> None:
     score_date = date(2026, 4, 24)
     rows = []
